@@ -697,6 +697,8 @@ class _MapLibreMapState extends State<MapLibreMap> {
     // otherwise a style that loads meanwhile starts an annotation setup on a
     // controller that never learns the map is gone.
     _mapController = controller;
+    // Своё дополнение: номер карты — для команд хода (README_LOCAL.md).
+    controller._viewId = id;
     // Nobody awaits this method: the platform view factory calls it and drops
     // the future. So a failure here has to reach the completer, or everything
     // waiting on the controller, including onStyleLoadedCallback above, waits

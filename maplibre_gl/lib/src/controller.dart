@@ -483,6 +483,183 @@ class MapLibreMapController extends ChangeNotifier {
 
   final MapLibrePlatform _maplibrePlatform;
 
+  // ── Своё дополнение (README_LOCAL.md) ────────────────────────────────────
+
+  /// Номер нативной карты — по нему адресуются команды хода.
+  int? _viewId;
+
+  /// Свой канал команд хода, мимо Pigeon: `maplibre_gl/motion_<id>` на обеих платформах.
+  MethodChannel? get _motionChannel {
+    final int? id = _viewId;
+    return id == null ? null : MethodChannel('maplibre_gl/motion_$id');
+  }
+
+  /// Ход меток на кадрах самой карты, все — в одном источнике [source]:
+  /// [still] стоят, [moving] едут от `from` к `to` (`[lat, lon, opacity,
+  /// scale]`) за [duration] по кривой [curve] (кубическая Безье `[a, b, c,
+  /// d]`, как у `Cubic`), трогаясь через [delay]. Прозрачность меняется в окне
+  /// `fade` (доли хода). На финише в источнике всё, кроме уходящих
+  /// (`leaving`).
+  ///
+  /// Каждый объект: `id`, `props` (свойства для выражений слоя), а у
+  /// неподвижных — `lat`, `lon`. Ответ — `true`, когда ход доиграл; `false`,
+  /// когда его сменил следующий.
+  Future<bool> transitionMarks({
+    required String source,
+    required List<Map<String, Object?>> still,
+    required List<Map<String, Object?>> moving,
+    required Duration duration,
+    required List<double> curve,
+    Duration delay = Duration.zero,
+    bool syncGlide = false,
+    Duration lead = Duration.zero,
+  }) async {
+    final MethodChannel? channel = _motionChannel;
+    if (channel == null) return false;
+    final bool? done = await channel.invokeMethod<bool>(
+      'marks#transition',
+      <String, Object?>{
+        'source': source,
+        'delayMs': delay.inMicroseconds / 1000,
+        // Идёт `glideCamera` — старт хода считает натив от настоящего начала
+        // перелёта, чтобы ход кончился за [lead] до прилёта.
+        'syncGlide': syncGlide,
+        'leadMs': lead.inMicroseconds / 1000,
+        'still': still,
+        'moving': moving,
+        'durationMs': duration.inMicroseconds / 1000,
+        'curve': curve,
+      },
+    );
+    return done ?? false;
+  }
+
+  /// Перелёт камеры на кадрах самой карты: точка ([lat], [lon]) едет по
+  /// экрану по прямой из [from] в [to] (логические точки), масштаб — из
+  /// [fromZoom] в [toZoom], за [duration] по кривой [curve]. Ответ — `true`,
+  /// когда доехали; `false`, когда оборвали ([stopGlide] или новый перелёт).
+  Future<bool> glideCamera({
+    required double lat,
+    required double lon,
+    required Offset from,
+    required Offset to,
+    required double fromZoom,
+    required double toZoom,
+    required Duration duration,
+    required List<double> curve,
+
+    /// Старт ([from], [fromZoom]) натив берёт от камеры в миг старта: идущий перелёт продолжится без прыжка.
+    bool fromCurrent = false,
+  }) async {
+    final MethodChannel? channel = _motionChannel;
+    if (channel == null) return false;
+    final bool? done = await channel
+        .invokeMethod<bool>('camera#glide', <String, Object?>{
+          'lat': lat,
+          'lon': lon,
+          'fromX': from.dx,
+          'fromY': from.dy,
+          'toX': to.dx,
+          'toY': to.dy,
+          'fromZoom': fromZoom,
+          'toZoom': toZoom,
+          'fromCurrent': fromCurrent,
+          'durationMs': duration.inMicroseconds / 1000,
+          'curve': curve,
+        });
+    return done ?? false;
+  }
+
+  /// Ход меток поставлен, но ещё не тронулся (ждёт старта в перелёте): на карте
+  /// всё ещё то, с чего он начнётся.
+  Future<bool> marksPending() async =>
+      await _motionChannel?.invokeMethod<bool>('marks#pending') ?? false;
+
+  /// Картинка готовыми пикселями: RGBA с предумноженной альфой, [scale] — плотность, в которой нарисована.
+  ///
+  /// В отличие от [addImage], натив не разбирает PNG на главном потоке. `false` — стиль ещё не готов.
+  Future<bool> addImageRaw(
+    String name,
+    Uint8List rgba, {
+    required int width,
+    required int height,
+    required double scale,
+  }) async =>
+      await _motionChannel?.invokeMethod<bool>(
+        'style#addImageRaw',
+        <String, Object?>{
+          'name': name,
+          'bytes': rgba,
+          'width': width,
+          'height': height,
+          'scale': scale,
+        },
+      ) ??
+      false;
+
+  /// Android: сила зума жестами — двойное нажатие и двойное нажатие с протяжкой (по умолчанию 1). На iOS не действует.
+  Future<void> setGestureZoomRate(double rate) async =>
+      _motionChannel?.invokeMethod<void>(
+        'map#gestureZoomRate',
+        <String, Object?>{'rate': rate},
+      );
+
+  /// Android: источник [sourceId] обновлять синхронно — до его создания. Ошибка движка (maplibre-native#4326): картинка,
+  /// добавленная в том же кадре, что и обновление такого источника, теряется — не добавлять картинки, пока он меняется.
+  /// На iOS обновление и так синхронное — вызов ничего не делает.
+  Future<void> setSourceSynchronous(String sourceId) async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    await _motionChannel?.invokeMethod<void>(
+      'source#synchronous',
+      <String, Object?>{'sourceId': sourceId},
+    );
+  }
+
+  /// Убрать картинки из стиля разом.
+  Future<void> removeImages(List<String> names) async =>
+      _motionChannel?.invokeMethod<void>(
+        'style#removeImages',
+        <String, Object?>{'names': names},
+      );
+
+  /// Замер кадров самой карты (integration_test приложения): начать копить промежутки между кадрами.
+  Future<void> benchFramesStart() async => _motionChannel?.invokeMethod<void>(
+    'bench#frames',
+    <String, Object?>{'start': true},
+  );
+
+  /// Закончить замер: `gaps` — промежутки между отрисованными кадрами карты (мс); на iOS ещё время перекладки
+  /// источника меток и добавления картинок (`shapeMs`/`shapeCalls`/`features`, `imageMs`/`imageCalls`), на Android —
+  /// `steps`, промежутки между шагами хода.
+  Future<Map<String, Object?>> benchFramesStop() async =>
+      (await _motionChannel?.invokeMapMethod<String, Object?>(
+        'bench#frames',
+        <String, Object?>{'start': false},
+      )) ??
+      const <String, Object?>{};
+
+  /// Тихий режим камеры: камеру на каждом кадре ставит Dart (карта едет за
+  /// шторкой), и натив шлёт одно «начала» и одно «встала» на всё время, а не
+  /// на каждый кадр. Выключили — одно «встала».
+  Future<void> setCameraQuiet(bool on) async => _motionChannel
+      ?.invokeMethod<void>('camera#quiet', <String, Object?>{'on': on});
+
+  /// Камера за шторкой: ставится последняя цель, один раз за кадр экрана (Android — в такт Choreographer).
+  /// Не ждёт ответа — Dart шлёт её на каждом своём кадре.
+  void followCamera(double lat, double lon, double zoom) {
+    unawaited(
+      _motionChannel?.invokeMethod<void>('camera#follow', <String, Object?>{
+        'lat': lat,
+        'lon': lon,
+        'zoom': zoom,
+      }),
+    );
+  }
+
+  /// Оборвать перелёт камеры.
+  Future<void> stopGlide() async =>
+      _motionChannel?.invokeMethod<void>('camera#stopGlide');
+
   /// Tracks whether the controller has already been disposed
   bool _isDisposed = false;
 

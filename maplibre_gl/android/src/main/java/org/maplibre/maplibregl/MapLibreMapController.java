@@ -203,6 +203,54 @@ final class MapLibreMapController
    */
   private final Bundle savedMapViewState = new Bundle();
   private float density;
+
+  // Своё дополнение (README_LOCAL.md): ход меток и перелёт камеры на кадрах карты — MapMotionAnimator.java.
+  private final MapMotionAnimator motion =
+      new MapMotionAnimator(
+          new MapMotionAnimator.Host() {
+            @Override
+            public Style style() {
+              return style;
+            }
+
+            @Override
+            public MapLibreMap map() {
+              return mapLibreMap;
+            }
+
+            @Override
+            public MapView view() {
+              return mapView;
+            }
+
+            @Override
+            public float density() {
+              return density;
+            }
+          });
+
+  /** Свой канал команд хода: `maplibre_gl/motion_<id>` (Dart: `MapLibreMapController` в controller.dart). */
+  private MethodChannel motionChannel;
+
+  // Сообщения о камере в Dart: «движется» — не чаще CAMERA_MOVE_GAP_NS, а в перелёте и тихом режиме «начала» —
+  // одно в начале, «встала» — одно в конце.
+  private static final long CAMERA_MOVE_GAP_NS = 50_000_000L;
+  private long lastCameraMove;
+  private boolean glideStartSent;
+
+  {
+    motion.onGlideDone = this::sendCameraIdle;
+  }
+
+  /** Источники с синхронным обновлением — до их создания (`source#synchronous`). */
+  private final java.util.Set<String> synchronousSources = new java.util.HashSet<>();
+
+  /** Замер кадров карты (integration_test): промежутки между кадрами, мс; {@code null} — не меряем. */
+  private java.util.List<Double> benchFrames;
+
+  private long benchLast;
+  private long benchMovedAt;
+  private boolean benchWasMoving;
   private final Context applicationContext;
   /**
    * Activity context used to build the {@link MapView}. Re-pointed at the current
@@ -367,6 +415,8 @@ final class MapLibreMapController
     this.messenger = messenger;
     this.flutterApi = new MapLibreMapFlutterApi(messenger, String.valueOf(id));
     MapLibreMapHostApi.Companion.setUp(messenger, new MapHostApi(this), String.valueOf(id));
+    this.motionChannel = new MethodChannel(messenger, "maplibre_gl/motion_" + id);
+    motionChannel.setMethodCallHandler(this::onMotionCall);
   }
 
   @Override
@@ -566,6 +616,175 @@ final class MapLibreMapController
     return mapLibreMap.getCameraPosition();
   }
 
+  // ── Своё дополнение (README_LOCAL.md) ────────────────────────────────────
+
+  /** Команды хода, картинок и замера — свой канал, мимо Pigeon. */
+  private void onMotionCall(@NonNull io.flutter.plugin.common.MethodCall call, @NonNull MethodChannel.Result result) {
+    if (mapLibreMap == null) {
+      result.success(call.method.equals("marks#pending") ? false : null);
+      return;
+    }
+    switch (call.method) {
+      case "marks#transition":
+        {
+          java.util.Map<String, Object> args = call.arguments();
+          if (args == null) {
+            result.success(false);
+          } else {
+            motion.transition(args, result);
+          }
+          break;
+        }
+      case "camera#glide":
+        {
+          java.util.Map<String, Object> args = call.arguments();
+          if (args == null) {
+            result.success(false);
+          } else {
+            motion.glide(args, result);
+          }
+          break;
+        }
+      case "camera#follow":
+        {
+          java.util.Map<String, Object> args = call.arguments();
+          if (args != null) motion.follow(args);
+          result.success(null);
+          break;
+        }
+      case "camera#stopGlide":
+        motion.stopGlide();
+        result.success(null);
+        break;
+      case "marks#pending":
+        result.success(motion.marksPending());
+        break;
+      case "source#synchronous":
+        {
+          final String sourceId = call.argument("sourceId");
+          if (sourceId != null) synchronousSources.add(sourceId);
+          result.success(null);
+          break;
+        }
+      case "map#gestureZoomRate":
+        {
+          // Сила зума жестами (двойное нажатие, двойное нажатие с протяжкой), по умолчанию 1.
+          final Number rate = call.argument("rate");
+          if (rate != null) mapLibreMap.getUiSettings().setZoomRate(rate.floatValue());
+          result.success(null);
+          break;
+        }
+      case "style#addImageRaw":
+        {
+          // Пиксели готовыми (RGBA, альфа предумножена) — без разбора PNG на главном потоке.
+          if (style == null || !style.isFullyLoaded()) {
+            result.success(false);
+            break;
+          }
+          final byte[] bytes = call.argument("bytes");
+          final Number width = call.argument("width");
+          final Number height = call.argument("height");
+          if (bytes == null || width == null || height == null) {
+            result.success(false);
+            break;
+          }
+          // ARGB_8888 держит в памяти именно RGBA с предумноженной альфой; плотность — устройства, как у разбора PNG.
+          final Bitmap bitmap = Bitmap.createBitmap(width.intValue(), height.intValue(), Bitmap.Config.ARGB_8888);
+          bitmap.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(bytes));
+          style.addImage(call.argument("name"), bitmap, false);
+          result.success(true);
+          break;
+        }
+      case "style#removeImages":
+        {
+          // Вытеснение картинок меток, которых давно нет на карте.
+          final java.util.List<String> names = call.argument("names");
+          if (style != null && style.isFullyLoaded() && names != null) {
+            for (String name : names) {
+              style.removeImage(name);
+            }
+          }
+          result.success(null);
+          break;
+        }
+      case "bench#frames":
+        {
+          // Замер кадров карты (integration_test приложения).
+          if (Boolean.TRUE.equals(call.argument("start"))) {
+            benchFrames = new java.util.ArrayList<>();
+            benchLast = 0;
+            MapMotionAnimator.benchSteps = new java.util.ArrayList<>();
+            result.success(null);
+          } else {
+            java.util.Map<String, Object> out = new java.util.HashMap<>();
+            out.put("gaps", benchFrames == null ? new java.util.ArrayList<Double>() : benchFrames);
+            // Промежутки между шагами хода меток внутри хода (до 100 мс), мс.
+            java.util.List<Double> steps = new java.util.ArrayList<>();
+            java.util.List<Long> at = MapMotionAnimator.benchSteps;
+            if (at != null) {
+              for (int i = 1; i < at.size(); i++) {
+                double d = (at.get(i) - at.get(i - 1)) / 1e6;
+                if (d <= 100) steps.add(d);
+              }
+            }
+            out.put("steps", steps);
+            MapMotionAnimator.benchSteps = null;
+            result.success(out);
+            benchFrames = null;
+          }
+          break;
+        }
+      case "camera#quiet":
+        {
+          boolean on = Boolean.TRUE.equals(call.argument("on"));
+          boolean was = motion.quiet;
+          motion.quiet = on;
+          // Тихий режим кончился — одно «встала» за всё время, что молчали.
+          if (was && !on && !motion.isGliding()) sendCameraIdle();
+          result.success(null);
+          break;
+        }
+      default:
+        result.notImplemented();
+    }
+  }
+
+  /**
+   * Поверхность карты просит у системы частоту экрана (до 120 Гц). Своей поверхностью (SurfaceView, в том числе под
+   * Hybrid Composition++) без просьбы система держала её на 60 Гц, и распады и ход меток шли рвано при 120 Гц у
+   * остального интерфейса (Pixel 8, 26.11.2026). В TextureView это не нужно — выводит Flutter.
+   */
+  private static void requestHighFrameRate(@Nullable View view) {
+    if (view == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return;
+    if (view instanceof android.view.SurfaceView) {
+      final android.view.SurfaceHolder holder = ((android.view.SurfaceView) view).getHolder();
+      final android.view.SurfaceHolder.Callback vote =
+          new android.view.SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(@NonNull android.view.SurfaceHolder h) {
+              h.getSurface().setFrameRate(120f, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+            }
+
+            @Override
+            public void surfaceChanged(@NonNull android.view.SurfaceHolder h, int format, int width, int height) {
+              h.getSurface().setFrameRate(120f, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+            }
+
+            @Override
+            public void surfaceDestroyed(@NonNull android.view.SurfaceHolder h) {}
+          };
+      holder.addCallback(vote);
+      if (holder.getSurface() != null && holder.getSurface().isValid()) {
+        holder.getSurface().setFrameRate(120f, android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+      }
+      return;
+    }
+    if (view instanceof android.view.ViewGroup) {
+      final android.view.ViewGroup group = (android.view.ViewGroup) view;
+      for (int i = 0; i < group.getChildCount(); i++) requestHighFrameRate(group.getChildAt(i));
+    }
+  }
+
   @Override
   public void onMapReady(MapLibreMap mapLibreMap) {
     this.mapLibreMap = mapLibreMap;
@@ -576,6 +795,7 @@ final class MapLibreMapController
     mapLibreMap.addOnCameraMoveStartedListener(this);
     mapLibreMap.addOnCameraMoveListener(this);
     mapLibreMap.addOnCameraIdleListener(this);
+    requestHighFrameRate(mapView);
 
     // Re-apply an app-provided attribution tint: UiSettings belongs to the
     // MapView, so a recreated view (activity rebind) would otherwise fall back
@@ -648,6 +868,19 @@ final class MapLibreMapController
         });
 
     mapView.addOnDidBecomeIdleListener(this);
+    // Своё дополнение: шаг перелёта и хода меток — в начале кадра карты (MapMotionAnimator.renderWillStart).
+    mapView.addOnWillStartRenderingFrameListener(() -> motion.renderWillStart());
+    // Замер кадров карты: промежутки между отрисованными кадрами, мс; пока не меряем — ничего не копится.
+    mapView.addOnDidFinishRenderingFrameListener(
+        (fully, encoding, rendering) -> {
+          if (benchFrames == null) return;
+          long now = System.nanoTime();
+          // Только в движении: пауза, пока карта стоит, — не провал кадра.
+          boolean moving = motion.isGliding() || motion.isMarksRunning() || now - benchMovedAt < 100_000_000L;
+          if (benchLast > 0 && moving && benchWasMoving) benchFrames.add((now - benchLast) / 1e6);
+          benchLast = now;
+          benchWasMoving = moving;
+        });
 
     setStyleString(styleStringInitial);
   }
@@ -1115,7 +1348,10 @@ final class MapLibreMapController
       // synchronousUpdate causes a texture atlas slot-reuse bug in MapLibre Native Android SDK
       // that silently discards icons registered via addImage() in the same render frame.
       // Disabled unconditionally until upstream maplibre-native#4326 is fixed.
-      GeoJsonOptions options = new GeoJsonOptions().withSynchronousUpdate(false);
+      // Своё дополнение: источники, о которых попросили (`source#synchronous`), — синхронно: ход меток ложится в
+      // тот же кадр, как на iOS. Ошибку выше приложение обходит само: картинки не добавляет, пока идёт ход.
+      GeoJsonOptions options =
+          new GeoJsonOptions().withSynchronousUpdate(synchronousSources.contains(sourceName));
       // The raw JSON goes to the engine, which parses it off the platform
       // thread and keeps numeric ids numeric. A Java FeatureCollection would
       // turn every id into a String, so ["id"] filters on numbers would miss.
@@ -4179,21 +4415,38 @@ final class MapLibreMapController
 
   @Override
   public void onCameraMoveStarted(int reason) {
+    if (motion.isQuiet()) {
+      if (glideStartSent) return;
+      glideStartSent = true;
+    } else {
+      glideStartSent = false;
+    }
     final boolean isGesture = reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE;
     flutterApi.cameraOnMoveStarted(isGesture, PigeonReplies.IGNORE);
   }
 
   @Override
   public void onCameraMove() {
+    benchMovedAt = System.nanoTime();
     if (!trackCameraPosition) {
       return;
     }
+    if (System.nanoTime() - lastCameraMove < CAMERA_MOVE_GAP_NS) return;
+    lastCameraMove = System.nanoTime();
     flutterApi.cameraOnMove(
         Convert.toPgCameraPosition(mapLibreMap.getCameraPosition()), PigeonReplies.IGNORE);
   }
 
   @Override
   public void onCameraIdle() {
+    // Перелёт или тихий режим: «встала» на каждом кадре не шлём — одно в конце.
+    if (motion.isQuiet()) return;
+    sendCameraIdle();
+  }
+
+  private void sendCameraIdle() {
+    glideStartSent = false;
+    if (mapLibreMap == null) return;
     flutterApi.cameraOnIdle(
         trackCameraPosition
             ? Convert.toPgCameraPosition(mapLibreMap.getCameraPosition())
@@ -4233,6 +4486,8 @@ final class MapLibreMapController
 
   @Override
   public void onDidBecomeIdle() {
+    // Своё дополнение: в перелёте и тихом режиме «карта встала» не шлём — оно приходило на каждом кадре.
+    if (motion.isQuiet()) return;
     flutterApi.mapOnIdle(PigeonReplies.IGNORE);
   }
 
@@ -4295,10 +4550,15 @@ final class MapLibreMapController
 
   @Override
   public void dispose() {
+    motion.dispose();
     if (disposed) {
       return;
     }
     disposed = true;
+    if (motionChannel != null) {
+      motionChannel.setMethodCallHandler(null);
+      motionChannel = null;
+    }
     cancelSnapshot("MAP_DISPOSED", "The map was disposed before the snapshot was ready.");
     MapLibreMapHostApi.Companion.setUp(messenger, null, String.valueOf(id));
     // A mapWaitForMap call parked while the map was still being built is only ever
