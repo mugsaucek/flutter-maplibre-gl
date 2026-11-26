@@ -87,6 +87,38 @@ class _MapLibreNativePlatform extends MapLibrePlatform
       final params = _creationParams(creationParams, android: view);
       // AndroidView lets Flutter draw the map into its frame; Hybrid
       // Composition needs the view created here.
+      if (view.composition == AndroidComposition.hybridCompositionPlusPlus) {
+        return PlatformViewLink(
+          viewType: 'plugins.flutter.io/maplibre_gl',
+          surfaceFactory: (context, controller) {
+            return AndroidViewSurface(
+              controller: controller as AndroidViewController,
+              gestureRecognizers:
+                  gestureRecognizers ??
+                  const <Factory<OneSequenceGestureRecognizer>>{},
+              hitTestBehavior: PlatformViewHitTestBehavior.opaque,
+            );
+          },
+          onCreatePlatformView: (viewParams) {
+            final controller = PlatformViewsService.initHybridAndroidView(
+              id: viewParams.id,
+              viewType: 'plugins.flutter.io/maplibre_gl',
+              layoutDirection: TextDirection.ltr,
+              creationParams: params,
+              creationParamsCodec: MapLibreMapHostApi.pigeonChannelCodec,
+              onFocus: () => viewParams.onFocusChanged(true),
+            );
+
+            controller.addOnPlatformViewCreatedListener(
+              viewParams.onPlatformViewCreated,
+            );
+            controller.addOnPlatformViewCreatedListener(onPlatformViewCreated);
+
+            unawaited(controller.create());
+            return controller;
+          },
+        );
+      }
       if (view.composition == AndroidComposition.hybridComposition) {
         return PlatformViewLink(
           viewType: 'plugins.flutter.io/maplibre_gl',

@@ -57,10 +57,6 @@ enum AndroidMapSurface {
 }
 
 /// Who puts the Android map on screen with your widgets.
-///
-/// If the app enables
-/// [Hybrid Composition++](https://maplibre.org/flutter-maplibre-gl/advanced/performance/#hybrid-composition)
-/// and the device supports it, Android does it, whatever the value.
 enum AndroidComposition {
   /// Flutter draws the map into its own frame, like any widget. The default.
   flutter,
@@ -69,6 +65,17 @@ enum AndroidComposition {
   /// Try it if map updates show up late, only when something else on screen
   /// moves. Flutter renders more slowly while the map is visible.
   hybridComposition,
+
+  /// [Hybrid Composition++](https://maplibre.org/flutter-maplibre-gl/advanced/performance/#hybrid-composition):
+  /// Android composes the map and Flutter's layers with SurfaceControl, with
+  /// no extra copy of Flutter's frame. Needs Android 14+ with Vulkan
+  /// (`HybridAndroidViewController.checkIfSupported()`) and the app's
+  /// `io.flutter.embedding.android.EnableHcpp` manifest flag; pick it only
+  /// when both hold. The default [flutter] never turns into it on its own:
+  /// with a [AndroidMapSurface.surfaceView] it falls back to Hybrid
+  /// Composition, where every Flutter frame over the map goes through an
+  /// image copy.
+  hybridCompositionPlusPlus,
 }
 
 typedef MapCreatedCallback = void Function(MapLibreMapController controller);
@@ -697,6 +704,8 @@ class _MapLibreMapState extends State<MapLibreMap> {
     // otherwise a style that loads meanwhile starts an annotation setup on a
     // controller that never learns the map is gone.
     _mapController = controller;
+    // Своё дополнение: номер карты — для команд хода (README_LOCAL.md).
+    controller._viewId = id;
     // Nobody awaits this method: the platform view factory calls it and drops
     // the future. So a failure here has to reach the completer, or everything
     // waiting on the controller, including onStyleLoadedCallback above, waits

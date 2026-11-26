@@ -88,6 +88,35 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
 
     private var interactiveFeatureLayerIds = Set<String>()
     private var addedShapesByLayer = [String: MLNShape]()
+
+    // Своё дополнение (README_LOCAL.md): ход меток и перелёт камеры на кадрах карты — MapMotionAnimator.swift.
+    private lazy var motion: MapMotionAnimator = {
+        let motion = MapMotionAnimator(mapView: mapView)
+        motion.onGlideDone = { [weak self] in
+            guard let self = self else { return }
+            self.glideStartSent = false
+            self.sendCameraIdle(self.getCameraPosition())
+        }
+        return motion
+    }()
+
+    /// Свой канал команд хода: `maplibre_gl/motion_<id>` (Dart: `MapLibreMapController` в controller.dart).
+    private var motionChannel: FlutterMethodChannel?
+
+    /// Сообщения о камере в Dart. Dart на iOS выполняется на главном потоке, и каждое сообщение синхронно
+    /// останавливает карту. Поэтому «движется» — не чаще `cameraMoveGap`, а в перелёте и тихом режиме «начала» —
+    /// одно в начале, «встала» — одно в конце.
+    private var lastCameraMove: CFTimeInterval = 0
+    private let cameraMoveGap: CFTimeInterval = 0.05
+    private var glideStartSent = false
+
+    /// Замер кадров карты: промежутки между отрисованными кадрами, мс; `nil` — не меряем.
+    private var benchFrames: [Double]?
+    private var benchLast: CFTimeInterval = 0
+    private var benchMovedAt: CFTimeInterval = 0
+    private var benchWasMoving = false
+    private var benchImageMs: Double?
+    private var benchImageCalls = 0
     /// The calls waiting for the view to have a size, in the order they came,
     /// each with the result that answers it.
     private var callsWaitingForSize: [(call: (MapLibreMapController) -> Void, result: FlutterResult)] = []
@@ -150,6 +179,8 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         // Drive the view out of its window and drop the remaining references so
         // the engine is reclaimed promptly when the platform view is removed.
         NotificationCenter.default.removeObserver(self)
+        motionChannel?.setMethodCallHandler(nil)
+        motion.dispose()
         // Fails the mapWaitForMap calls still waiting for the style, whose Dart
         // futures would otherwise never complete.
         let waitingForMap = mapReadyResults
@@ -255,6 +286,14 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
 
         hostApi.controller = self
         hostApi.register(binaryMessenger: binaryMessenger, messageChannelSuffix: channelSuffix)
+        motionChannel = FlutterMethodChannel(name: "maplibre_gl/motion_\(viewId)", binaryMessenger: messenger)
+        motionChannel?.setMethodCallHandler { [weak self] call, result in
+            guard let self = self else {
+                result(nil)
+                return
+            }
+            self.onMotionCall(call, result: result)
+        }
 
         mapView.delegate = self
         (mapView as? LocationPuckMapView)?.onTintColorDidChange = { [weak self] in
@@ -3500,6 +3539,8 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     ]
 
     func mapViewWillStartRenderingFrame(_: MLNMapView) {
+        // Своё дополнение: шаг перелёта и хода меток — в начале кадра карты (см. MapMotionAnimator.renderWillStart).
+        motion.renderWillStart()
         guard pendingInitialCamera != nil || !callsWaitingForSize.isEmpty else { return }
         // A frame is drawn once the view has a size. Apply outside the render
         // callback; a Dart call that gets there first applies it and this is a no-op.
@@ -3509,7 +3550,137 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         }
     }
 
+    func mapViewDidFinishRenderingFrame(_: MLNMapView, fullyRendered _: Bool) {
+        guard benchFrames != nil else { return }
+        let now = CACurrentMediaTime()
+        // Только в движении: пауза, пока карта стоит, — не провал кадра.
+        let moving = motion.isGliding || motion.isMarksRunning || now - benchMovedAt < 0.1
+        if benchLast > 0, moving, benchWasMoving { benchFrames?.append((now - benchLast) * 1000) }
+        benchLast = now
+        benchWasMoving = moving
+    }
+
+    // ── Своё дополнение (README_LOCAL.md) ────────────────────────────────────
+
+    /// Команды хода, картинок и замера — свой канал, мимо Pigeon.
+    private func onMotionCall(_ methodCall: FlutterMethodCall, result: @escaping FlutterResult) {
+        switch methodCall.method {
+        case "marks#transition":
+            guard let arguments = methodCall.arguments as? [String: Any] else {
+                result(false)
+                return
+            }
+            motion.transition(arguments, result: result)
+        case "camera#glide":
+            guard let arguments = methodCall.arguments as? [String: Any] else {
+                result(false)
+                return
+            }
+            motion.glide(arguments, result: result)
+        case "camera#follow":
+            // Камера за шторкой. На iOS карта — настоящий вид, ставим сразу.
+            if let a = methodCall.arguments as? [String: Any],
+               let lat = a["lat"] as? Double, let lon = a["lon"] as? Double, let zoom = a["zoom"] as? Double
+            {
+                mapView.setCenter(CLLocationCoordinate2D(latitude: lat, longitude: lon), zoomLevel: zoom, animated: false)
+            }
+            result(nil)
+        case "camera#stopGlide":
+            motion.stopGlide()
+            result(nil)
+        case "marks#pending":
+            result(motion.marksPending)
+        case "source#synchronous":
+            // На iOS обновление источника и так синхронное.
+            result(nil)
+        case "style#addImageRaw":
+            // Пиксели готовыми (RGBA, альфа предумножена) — без разбора PNG на главном потоке.
+            guard let a = methodCall.arguments as? [String: Any],
+                  let name = a["name"] as? String,
+                  let bytes = a["bytes"] as? FlutterStandardTypedData,
+                  let width = a["width"] as? Int,
+                  let height = a["height"] as? Int,
+                  let scale = a["scale"] as? Double,
+                  let style = mapView.style,
+                  let provider = CGDataProvider(data: bytes.data as CFData),
+                  let image = CGImage(
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bitsPerPixel: 32,
+                      bytesPerRow: width * 4,
+                      space: CGColorSpaceCreateDeviceRGB(),
+                      bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+                      provider: provider,
+                      decode: nil,
+                      shouldInterpolate: false,
+                      intent: .defaultIntent
+                  )
+            else {
+                result(false)
+                return
+            }
+            let started = CACurrentMediaTime()
+            style.setImage(UIImage(cgImage: image, scale: CGFloat(scale), orientation: .up), forName: name)
+            if let spent = benchImageMs {
+                benchImageMs = spent + (CACurrentMediaTime() - started) * 1000
+                benchImageCalls += 1
+            }
+            result(true)
+        case "style#removeImages":
+            // Вытеснение картинок меток, которых давно нет на карте.
+            let names = (methodCall.arguments as? [String: Any])?["names"] as? [String] ?? []
+            for name in names {
+                mapView.style?.removeImage(forName: name)
+            }
+            result(nil)
+        case "map#gestureZoomRate":
+            // Только Android.
+            result(nil)
+        case "bench#frames":
+            // Замер кадров карты (integration_test приложения).
+            let start = (methodCall.arguments as? [String: Any])?["start"] as? Bool ?? false
+            if start {
+                benchFrames = []
+                benchLast = 0
+                benchImageMs = 0
+                benchImageCalls = 0
+                MapMotionAnimator.benchShapeMs = 0
+                MapMotionAnimator.benchShapeCalls = 0
+                MapMotionAnimator.benchFeatures = 0
+                result(nil)
+            } else {
+                result([
+                    "gaps": benchFrames ?? [],
+                    "shapeMs": MapMotionAnimator.benchShapeMs ?? 0,
+                    "shapeCalls": MapMotionAnimator.benchShapeCalls,
+                    "features": MapMotionAnimator.benchFeatures,
+                    "imageMs": benchImageMs ?? 0,
+                    "imageCalls": benchImageCalls,
+                ])
+                benchFrames = nil
+                benchImageMs = nil
+                MapMotionAnimator.benchShapeMs = nil
+            }
+        case "camera#quiet":
+            let on = (methodCall.arguments as? [String: Any])?["on"] as? Bool ?? false
+            let was = motion.quiet
+            motion.quiet = on
+            // Тихий режим кончился — одно «встала» за всё время, что молчали.
+            if was && !on && !motion.isGliding {
+                glideStartSent = false
+                sendCameraIdle(getCameraPosition())
+            }
+            result(nil)
+        default:
+            result(FlutterMethodNotImplemented)
+        }
+    }
+
     func mapViewDidBecomeIdle(_: MLNMapView) {
+        // Своё дополнение: в перелёте и тихом режиме камеру ставят на каждом кадре, и «карта встала» приходило тоже
+        // на каждом — разбор в Dart на главном потоке.
+        if motion.isQuiet { return }
         flutterApi?.mapOnIdle { _ in }
     }
 
@@ -3525,7 +3696,14 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         if heldBackIdle {
             // Continues the motion it stopped, which Dart still sees as moving (#1152).
             heldBackIdle = false
+        } else if motion.isQuiet {
+            // Перелёт (или камера за шторкой) ставит камеру на каждом кадре — «начала» одно, на первом.
+            if !glideStartSent {
+                glideStartSent = true
+                flutterApi?.cameraOnMoveStarted(isGesture: isGesture) { _ in }
+            }
         } else {
+            glideStartSent = false
             flutterApi?.cameraOnMoveStarted(isGesture: isGesture) { _ in }
         }
         // Where the change starts, so regionDidChange can tell whether the camera moved.
@@ -3533,7 +3711,9 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     }
 
     func mapViewRegionIsChanging(_ mapView: MLNMapView) {
+        if benchFrames != nil { benchMovedAt = CACurrentMediaTime() }
         keepGestureTargetInBounds()
+        if CACurrentMediaTime() - lastCameraMove < cameraMoveGap { return }
         // Never nil when the position is tracked: getCameraPosition() answers whenever it is.
         guard let position = getCameraPosition() else { return }
         sendCameraMove(position)
@@ -3541,6 +3721,7 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
 
     private func sendCameraMove(_ position: PgCameraPosition) {
         lastMovePosition = position
+        lastCameraMove = CACurrentMediaTime()
         flutterApi?.cameraOnMove(position: position) { _ in }
     }
 
@@ -3771,6 +3952,15 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
         animated: Bool
     ) {
         cameraAnimations.regionDidChange(reason: reason, animated: animated)
+        // Своё дополнение: перелёт или тихий режим — «встала» на каждом кадре не шлём, одно в конце
+        // (`motion.onGlideDone`, `camera#quiet`). Положение Dart всё равно нужно — не чаще `cameraMoveGap`.
+        if motion.isQuiet {
+            if CACurrentMediaTime() - lastCameraMove >= cameraMoveGap, let position = getCameraPosition() {
+                sendCameraMove(position)
+            }
+            return
+        }
+        glideStartSent = false
         // The motion a camera call of Dart stops to start its own change (#1152).
         if isReplacingCameraMotion && reason.contains(.transitionCancelled) {
             heldBackIdle = true
